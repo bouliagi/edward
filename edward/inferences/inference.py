@@ -2,220 +2,135 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import multiprocessing
+import abc
 import numpy as np
 import six
 import tensorflow as tf
-import warnings
+import os
 
-from edward.models import RandomVariable, StanModel
-from edward.util import get_session
-
-try:
-  import theano
-except ImportError:
-  pass
+from datetime import datetime
+from edward.models import RandomVariable
+from edward.util import check_data, check_latent_vars, get_session, \
+    get_variables, Progbar
 
 
+@six.add_metaclass(abc.ABCMeta)
 class Inference(object):
-  """Base class for Edward inference methods.
+  """Abstract base class for inference. All inference algorithms in
+  Edward inherit from `Inference`, sharing common methods and
+  properties via a class hierarchy.
 
-  Attributes
-  ----------
-  latent_vars : dict of RandomVariable to RandomVariable
-    Collection of random variables to perform inference on. Each
-    random variable is binded to another random variable; the latter
-    will infer the former conditional on data.
-  data : dict
-    Data dictionary whose values may vary at each session run.
-  model_wrapper : ed.Model or None
-    An optional wrapper for the probability model. If specified, the
-    random variables in ``latent_vars``' dictionary keys are strings
-    used accordingly by the wrapper.
+  Specific algorithms typically inherit from other subclasses of
+  `Inference` rather than `Inference` directly. For example, one
+  might inherit from the abstract classes `MonteCarlo` or
+  `VariationalInference`.
+
+  To build an algorithm inheriting from `Inference`, one must at the
+  minimum implement `initialize` and `update`: the former builds
+  the computational graph for the algorithm; the latter runs the
+  computational graph for the algorithm.
+
+  To reset inference (e.g., internal variable counters incremented
+  over training), fetch inference's reset ops from session with
+  `sess.run(inference.reset)`.
+
+  #### Examples
+
+  ```python
+  # Set up probability model.
+  mu = Normal(loc=0.0, scale=1.0)
+  x = Normal(loc=mu, scale=1.0, sample_shape=50)
+
+  # Set up posterior approximation.
+  qmu_loc = tf.Variable(tf.random_normal([]))
+  qmu_scale = tf.nn.softplus(tf.Variable(tf.random_normal([])))
+  qmu = Normal(loc=qmu_loc, scale=qmu_scale)
+
+  inference = ed.Inference({mu: qmu}, data={x: tf.zeros(50)})
+  ```
   """
-  def __init__(self, latent_vars=None, data=None, model_wrapper=None):
-    """Initialization.
+  def __init__(self, latent_vars=None, data=None):
+    """Create an inference algorithm.
 
-    Parameters
-    ----------
-    latent_vars : dict of RandomVariable to RandomVariable, optional
-      Collection of random variables to perform inference on. Each
-      random variable is binded to another random variable; the latter
-      will infer the former conditional on data.
-    data : dict, optional
-      Data dictionary which binds observed variables (of type
-      ``RandomVariable``) to their realizations (of type ``tf.Tensor``).
-      It can also bind placeholders (of type ``tf.Tensor``) used in the
-      model to their realizations; and prior latent variables (of type
-      ``RandomVariable``) to posterior latent variables (of type
-      ``RandomVariable``).
-    model_wrapper : ed.Model, optional
-      A wrapper for the probability model. If specified, the random
-      variables in ``latent_vars``' dictionary keys are strings
-      used accordingly by the wrapper. ``data`` is also changed. For
-      TensorFlow, Python, and Stan models, the key type is a string;
-      for PyMC3, the key type is a Theano shared variable. For
-      TensorFlow, Python, and PyMC3 models, the value type is a NumPy
-      array or TensorFlow tensor; for Stan, the value type is the
-      type according to the Stan program's data block.
-
-    Notes
-    -----
-    If ``data`` is not passed in, the dictionary is empty.
-
-    Three options are available for batch training:
-
-    1. internally if user passes in data as a dictionary of NumPy
-       arrays;
-    2. externally if user passes in data as a dictionary of
-       TensorFlow placeholders (and manually feeds them);
-    3. externally if user passes in data as TensorFlow tensors
-       which are the outputs of data readers.
-
-    Examples
-    --------
-    >>> mu = Normal(mu=tf.constant(0.0), sigma=tf.constant(1.0))
-    >>> x = Normal(mu=tf.ones(N) * mu, sigma=tf.constant(1.0))
-    >>>
-    >>> qmu_mu = tf.Variable(tf.random_normal([1]))
-    >>> qmu_sigma = tf.nn.softplus(tf.Variable(tf.random_normal([1])))
-    >>> qmu = Normal(mu=qmu_mu, sigma=qmu_sigma)
-    >>>
-    >>> Inference({mu: qmu}, {x: tf.constant([0.0] * N)})
+    Args:
+      latent_vars: dict, optional.
+        Collection of latent variables (of type `RandomVariable` or
+        `tf.Tensor`) to perform inference on. Each random variable is
+        binded to another random variable; the latter will infer the
+        former conditional on data.
+      data: dict, optional.
+        Data dictionary which binds observed variables (of type
+        `RandomVariable` or `tf.Tensor`) to their realizations (of
+        type `tf.Tensor`). It can also bind placeholders (of type
+        `tf.Tensor`) used in the model to their realizations; and
+        prior latent variables (of type `RandomVariable`) to posterior
+        latent variables (of type `RandomVariable`).
     """
     sess = get_session()
     if latent_vars is None:
       latent_vars = {}
-    elif not isinstance(latent_vars, dict):
-      raise TypeError()
-
-    for key, value in six.iteritems(latent_vars):
-      if isinstance(value, RandomVariable):
-        if isinstance(key, RandomVariable):
-          if not key.value().get_shape().is_compatible_with(
-                  value.value().get_shape()):
-            raise TypeError("Latent variable bindings do not have same shape.")
-        elif not isinstance(key, str):
-          raise TypeError("Latent variable key has an invalid type.")
-      else:
-        raise TypeError("Latent variable value has an invalid type.")
-
-    self.latent_vars = latent_vars
-
     if data is None:
       data = {}
-    elif not isinstance(data, dict):
-      raise TypeError()
 
-    if isinstance(model_wrapper, StanModel):
-      # Stan models do no support data subsampling because they
-      # take arbitrary data structure types in the data block
-      # and not just NumPy arrays (this makes it unamenable to
-      # TensorFlow placeholders). Therefore fix the data
-      # dictionary ``self.data`` at compile time to ``data``.
-      self.data = data
-    else:
-      self.data = {}
-      for key, value in six.iteritems(data):
-        if isinstance(key, RandomVariable):
-          if isinstance(value, tf.Tensor):
-            if not key.value().get_shape().is_compatible_with(
-                    value.get_shape()):
-              raise TypeError("Observed variable bindings do not have same "
-                              "shape.")
+    check_latent_vars(latent_vars)
+    self.latent_vars = latent_vars
 
-            self.data[key] = tf.cast(value, tf.float32)
-          elif isinstance(value, np.ndarray):
-            if not key.value().get_shape().is_compatible_with(value.shape):
-              raise TypeError("Observed variable bindings do not have same "
-                              "shape.")
-
-            # If value is a np.ndarray, store it in the graph.
-            ph = tf.placeholder(tf.float32, value.shape)
-            var = tf.Variable(ph, trainable=False, collections=[])
-            self.data[key] = var
-            sess.run(var.initializer, {ph: value})
-          elif isinstance(value, RandomVariable):
-            if not key.value().get_shape().is_compatible_with(
-                    value.value().get_shape()):
-              raise TypeError("Observed variable bindings do not have same "
-                              "shape.")
-
-            self.data[key] = value
-          else:
-            raise TypeError("Data value has an invalid type.")
-        elif isinstance(key, str):
-          if isinstance(value, tf.Tensor):
-            self.data[key] = tf.cast(value, tf.float32)
-          elif isinstance(value, np.ndarray):
-            ph = tf.placeholder(tf.float32, value.shape)
-            var = tf.Variable(ph, trainable=False, collections=[])
-            self.data[key] = var
-            sess.run(var.initializer, {ph: value})
-          else:
-            self.data[key] = value
-        elif isinstance(key, theano.tensor.sharedvar.TensorSharedVariable):
+    check_data(data)
+    self.data = {}
+    for key, value in six.iteritems(data):
+      if isinstance(key, tf.Tensor) and "Placeholder" in key.op.type:
+        self.data[key] = value
+      elif isinstance(key, (RandomVariable, tf.Tensor)):
+        if isinstance(value, (RandomVariable, tf.Tensor)):
           self.data[key] = value
-        elif isinstance(key, tf.Tensor):
-          if isinstance(value, RandomVariable):
-            raise TypeError("Data placeholder cannot be bound to a "
-                            "RandomVariable.")
-
-          self.data[key] = value
-        else:
-          raise TypeError("Data key has an invalid type.")
-
-    if model_wrapper is not None:
-      warnings.simplefilter('default', DeprecationWarning)
-      warnings.warn("Model wrappers are deprecated. Edward is dropping "
-                    "support for model wrappers in future versions; use the "
-                    "native language instead.", DeprecationWarning)
-
-    self.model_wrapper = model_wrapper
+        elif isinstance(value, (float, list, int, np.ndarray, np.number, str)):
+          # If value is a Python type, store it in the graph.
+          # Assign its placeholder with the key's data type.
+          with tf.variable_scope(None, default_name="data"):
+            ph = tf.placeholder(key.dtype, np.shape(value))
+            var = tf.Variable(ph, trainable=False, collections=[])
+            sess.run(var.initializer, {ph: value})
+            self.data[key] = var
 
   def run(self, variables=None, use_coordinator=True, *args, **kwargs):
     """A simple wrapper to run inference.
 
-    1. Initialize algorithm via ``initialize``.
-    2. (Optional) Build a ``tf.train.SummaryWriter`` for TensorBoard.
+    1. Initialize algorithm via `initialize`.
+    2. (Optional) Build a TensorFlow summary writer for TensorBoard.
     3. (Optional) Initialize TensorFlow variables.
     4. (Optional) Start queue runners.
-    5. Run ``update`` for ``self.n_iter`` iterations.
-    6. While running, ``print_progress``.
-    7. Finalize algorithm via ``finalize``.
+    5. Run `update` for `self.n_iter` iterations.
+    6. While running, `print_progress`.
+    7. Finalize algorithm via `finalize`.
     8. (Optional) Stop queue runners.
 
     To customize the way inference is run, run these steps
     individually.
 
-    Parameters
-    ----------
-    variables : list, optional
-      A list of TensorFlow variables to initialize during inference.
-      Default is to initialize all variables (this includes
-      reinitializing variables that were already initialized). To
-      avoid initializing any variables, pass in an empty list.
-    use_coordinator : bool, optional
-      Whether to start and stop queue runners during inference using a
-      TensorFlow coordinator. For example, queue runners are necessary
-      for batch training with the ``n_minibatch`` argument or with
-      file readers.
-    *args
-      Passed into ``initialize``.
-    **kwargs
-      Passed into ``initialize``.
+    Args:
+      variables: list, optional.
+        A list of TensorFlow variables to initialize during inference.
+        Default is to initialize all variables (this includes
+        reinitializing variables that were already initialized). To
+        avoid initializing any variables, pass in an empty list.
+      use_coordinator: bool, optional.
+        Whether to start and stop queue runners during inference using a
+        TensorFlow coordinator. For example, queue runners are necessary
+        for batch training with file readers.
+      *args, **kwargs:
+        Passed into `initialize`.
     """
     self.initialize(*args, **kwargs)
 
     if variables is None:
-      init = tf.initialize_all_variables()
+      init = tf.global_variables_initializer()
     else:
-      init = tf.initialize_variables(variables)
+      init = tf.variables_initializer(variables)
 
     # Feed placeholders in case initialization depends on them.
     feed_dict = {}
     for key, value in six.iteritems(self.data):
-      if isinstance(key, tf.Tensor):
+      if isinstance(key, tf.Tensor) and "Placeholder" in key.op.type:
         feed_dict[key] = value
 
     init.run(feed_dict)
@@ -236,83 +151,75 @@ class Inference(object):
       self.coord.request_stop()
       self.coord.join(self.threads)
 
-  def initialize(self, n_iter=1000, n_print=None, n_minibatch=None, scale=None,
-                 logdir=None, debug=False):
-    """Initialize inference algorithm.
+  @abc.abstractmethod
+  def initialize(self, n_iter=1000, n_print=None, scale=None, logdir=None,
+                 log_timestamp=True, log_vars=None, debug=False):
+    """Initialize inference algorithm. It initializes hyperparameters
+    and builds ops for the algorithm's computation graph.
 
-    Parameters
-    ----------
-    n_iter : int, optional
-      Number of iterations for algorithm.
-    n_print : int, optional
-      Number of iterations for each print progress. To suppress print
-      progress, then specify 0. Default is ``int(n_iter / 10)``.
-    n_minibatch : int, optional
-      Number of samples for data subsampling. Default is to use all
-      the data. ``n_minibatch`` is available only for TensorFlow,
-      Python, and PyMC3 model wrappers; use ``scale`` for Edward's
-      language. All data must be passed in as NumPy arrays. For
-      subsampling details, see ``tf.train.slice_input_producer`` and
-      ``tf.train.batch``.
-    scale : dict of RandomVariable to tf.Tensor, optional
-      A scalar value to scale computation for any random variable that
-      it is binded to. For example, this is useful for scaling
-      computations with respect to local latent variables.
-    logdir : str, optional
-      Directory where event file will be written. For details,
-      see ``tf.train.SummaryWriter``. Default is to write nothing.
-    debug : bool, optional
-      If True, add checks for ``NaN`` and ``Inf`` to all computations
-      in the graph. May result in substantially slower execution
-      times.
+    Any derived class of `Inference` **must** implement this method.
+    No methods which build ops should be called outside `initialize()`.
+
+    Args:
+      n_iter: int, optional.
+        Number of iterations for algorithm when calling `run()`.
+        Alternatively if controlling inference manually, it is the
+        expected number of calls to `update()`; this number determines
+        tracking information during the print progress.
+      n_print: int, optional.
+        Number of iterations for each print progress. To suppress print
+        progress, then specify 0. Default is `int(n_iter / 100)`.
+      scale: dict of RandomVariable to tf.Tensor, optional.
+        A tensor to scale computation for any random variable that it is
+        binded to. Its shape must be broadcastable; it is multiplied
+        element-wise to the random variable. For example, this is useful
+        for mini-batch scaling when inferring global variables, or
+        applying masks on a random variable.
+      logdir: str, optional.
+        Directory where event file will be written. For details,
+        see `tf.summary.FileWriter`. Default is to log nothing.
+      log_timestamp: bool, optional.
+        If True (and `logdir` is specified), create a subdirectory of
+        `logdir` to save the specific run results. The subdirectory's
+        name is the current UTC timestamp with format 'YYYYMMDD_HHMMSS'.
+      log_vars: list, optional.
+        Specifies the list of variables to log after each `n_print`
+        steps. If None, will log all variables. If `[]`, no variables
+        will be logged. `logdir` must be specified for variables to be
+        logged.
+      debug: bool, optional.
+        If True, add checks for `NaN` and `Inf` to all computations
+        in the graph. May result in substantially slower execution
+        times.
     """
     self.n_iter = n_iter
     if n_print is None:
-      self.n_print = int(n_iter / 10)
+      self.n_print = int(n_iter / 100)
     else:
       self.n_print = n_print
 
-    self.t = tf.Variable(0, trainable=False)
+    self.progbar = Progbar(self.n_iter)
+    self.t = tf.Variable(0, trainable=False, name="iteration")
+
     self.increment_t = self.t.assign_add(1)
 
     if scale is None:
       scale = {}
     elif not isinstance(scale, dict):
-      raise TypeError()
+      raise TypeError("scale must be a dict object.")
 
     self.scale = scale
-    self.n_minibatch = n_minibatch
-    if n_minibatch is not None and \
-       self.model_wrapper is not None and \
-       not isinstance(self.model_wrapper, StanModel):
-      # Re-assign data to batch tensors, with size given by
-      # ``n_minibatch``. Don't do this for random variables in data.
-      dict_rv = {}
-      dict_data = {}
-      for key, value in six.iteritems(self.data):
-        if isinstance(value, RandomVariable):
-          dict_rv[key] = value
-        else:
-          dict_data[key] = value
-
-      values = list(six.itervalues(dict_data))
-      slices = tf.train.slice_input_producer(values)
-      # By default use as many threads as CPUs.
-      batches = tf.train.batch(slices, n_minibatch,
-                               num_threads=multiprocessing.cpu_count())
-      if not isinstance(batches, list):
-        # ``tf.train.batch`` returns tf.Tensor if ``slices`` is a
-        # list of size 1.
-        batches = [batches]
-
-      self.data = {key: value for key, value in
-                   zip(six.iterkeys(dict_data), batches)}
-      self.data.update(dict_rv)
 
     if logdir is not None:
       self.logging = True
-      self.train_writer = tf.train.SummaryWriter(logdir, tf.get_default_graph())
-      self.summarize = tf.merge_all_summaries()
+      if log_timestamp:
+        logdir = os.path.expanduser(logdir)
+        logdir = os.path.join(
+            logdir, datetime.strftime(datetime.utcnow(), "%Y%m%d_%H%M%S"))
+
+      self._summary_key = tf.get_default_graph().unique_name("summaries")
+      self._set_log_variables(log_vars)
+      self.train_writer = tf.summary.FileWriter(logdir, tf.get_default_graph())
     else:
       self.logging = False
 
@@ -320,32 +227,37 @@ class Inference(object):
     if self.debug:
       self.op_check = tf.add_check_numerics_ops()
 
+    # Store reset ops which user can call. Subclasses should append
+    # any ops needed to reset internal variables in inference.
+    self.reset = [tf.variables_initializer([self.t])]
+
+  @abc.abstractmethod
   def update(self, feed_dict=None):
     """Run one iteration of inference.
 
-    Parameters
-    ----------
-    feed_dict : dict, optional
-      Feed dictionary for a TensorFlow session run. It is used to feed
-      placeholders that are not fed during initialization.
+    Any derived class of `Inference` **must** implement this method.
 
-    Returns
-    -------
-    dict
-      Dictionary of algorithm-specific information.
+    Args:
+      feed_dict: dict, optional.
+        Feed dictionary for a TensorFlow session run. It is used to feed
+        placeholders that are not fed during initialization.
+
+    Returns:
+      dict.
+        Dictionary of algorithm-specific information.
     """
     if feed_dict is None:
       feed_dict = {}
 
     for key, value in six.iteritems(self.data):
-      if isinstance(key, tf.Tensor):
+      if isinstance(key, tf.Tensor) and "Placeholder" in key.op.type:
         feed_dict[key] = value
 
     sess = get_session()
     t = sess.run(self.increment_t)
 
     if self.debug:
-      sess.run(self.op_check)
+      sess.run(self.op_check, feed_dict)
 
     if self.logging and self.n_print != 0:
       if t == 1 or t % self.n_print == 0:
@@ -357,20 +269,55 @@ class Inference(object):
   def print_progress(self, info_dict):
     """Print progress to output.
 
-    Parameters
-    ----------
-    info_dict : dict
-      Dictionary of algorithm-specific information.
+    Args:
+      info_dict: dict.
+        Dictionary of algorithm-specific information.
     """
     if self.n_print != 0:
       t = info_dict['t']
       if t == 1 or t % self.n_print == 0:
-        string = 'Iteration {0}'.format(str(t).rjust(len(str(self.n_iter))))
-        string += ' [{0}%]'.format(str(int(t / self.n_iter * 100)).rjust(3))
-        print(string)
+        self.progbar.update(t)
 
   def finalize(self):
     """Function to call after convergence.
     """
     if self.logging:
       self.train_writer.close()
+
+  def _set_log_variables(self, log_vars=None):
+    """Log variables to TensorBoard.
+
+    For each variable in `log_vars`, forms a `tf.summary.scalar` if
+    the variable has scalar shape; otherwise forms a `tf.summary.histogram`.
+
+    Args:
+      log_vars: list, optional.
+        Specifies the list of variables to log after each `n_print`
+        steps. If None, will log all variables. If `[]`, no variables
+        will be logged.
+    """
+    if log_vars is None:
+      log_vars = []
+      for key in six.iterkeys(self.data):
+        log_vars += get_variables(key)
+
+      for key, value in six.iteritems(self.latent_vars):
+        log_vars += get_variables(key)
+        log_vars += get_variables(value)
+
+      log_vars = set(log_vars)
+
+    for var in log_vars:
+      # replace colons which are an invalid character
+      var_name = var.name.replace(':', '/')
+      # Log all scalars.
+      if len(var.shape) == 0:
+        tf.summary.scalar("parameter/{}".format(var_name),
+                          var, collections=[self._summary_key])
+      elif len(var.shape) == 1 and var.shape[0] == 1:
+        tf.summary.scalar("parameter/{}".format(var_name),
+                          var[0], collections=[self._summary_key])
+      else:
+        # If var is multi-dimensional, log a histogram of its values.
+        tf.summary.histogram("parameter/{}".format(var_name),
+                             var, collections=[self._summary_key])
