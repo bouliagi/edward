@@ -10,11 +10,6 @@ from edward.inferences.monte_carlo import MonteCarlo
 from edward.models import RandomVariable
 from edward.util import check_latent_vars, copy
 
-try:
-  from edward.models import Uniform
-except Exception as e:
-  raise ImportError("{0}. Your TensorFlow version is not supported.".format(e))
-
 
 class MetropolisHastings(MonteCarlo):
   """Metropolis-Hastings [@metropolis1953equation; @hastings1970monte].
@@ -33,6 +28,10 @@ class MetropolisHastings(MonteCarlo):
   leveraging a single Monte Carlo sample, where $\\beta^* \sim
   q(\\beta)$. This is unbiased (and therefore asymptotically exact as a
   pseudo-marginal method) if $q(\\beta) = p(\\beta \mid x)$.
+
+  `MetropolisHastings` assumes the proposal distribution has the same
+  support as the prior. The `auto_transform` attribute in
+  the method `initialize()` is not applicable.
 
   #### Examples
 
@@ -58,13 +57,17 @@ class MetropolisHastings(MonteCarlo):
     self.proposal_vars = proposal_vars
     super(MetropolisHastings, self).__init__(latent_vars, data)
 
+  def initialize(self, *args, **kwargs):
+    kwargs['auto_transform'] = False
+    return super(MetropolisHastings, self).initialize(*args, **kwargs)
+
   def build_update(self):
     """Draw sample from proposal conditional on last sample. Then
     accept or reject the sample based on the ratio,
 
     $\\text{ratio} =
-          \log p(x, z^{\\text{new}}) - \log p(x, z^{\\text{old}}) +
-          \log g(z^{\\text{new}} \mid z^{\\text{old}}) -
+          \log p(x, z^{\\text{new}}) - \log p(x, z^{\\text{old}}) -
+          \log g(z^{\\text{new}} \mid z^{\\text{old}}) +
           \log g(z^{\\text{old}} \mid z^{\\text{new}})$
 
     #### Notes
@@ -102,7 +105,7 @@ class MetropolisHastings(MonteCarlo):
       # Sample znew ~ g(znew | zold).
       new_sample[z] = proposal_znew.value()
       # Increment ratio.
-      ratio += tf.reduce_sum(proposal_znew.log_prob(new_sample[z]))
+      ratio -= tf.reduce_sum(proposal_znew.log_prob(new_sample[z]))
 
     dict_swap_new = dict_swap.copy()
     dict_swap_new.update(new_sample)
@@ -111,7 +114,7 @@ class MetropolisHastings(MonteCarlo):
       # Build proposal g(zold | znew).
       proposal_zold = copy(proposal_z, dict_swap_new, scope=scope_new)
       # Increment ratio.
-      ratio -= tf.reduce_sum(proposal_zold.log_prob(dict_swap_old[z]))
+      ratio += tf.reduce_sum(proposal_zold.log_prob(dict_swap_old[z]))
 
     for z in six.iterkeys(self.latent_vars):
       # Build priors p(znew) and p(zold).
@@ -131,7 +134,7 @@ class MetropolisHastings(MonteCarlo):
         ratio -= tf.reduce_sum(x_zold.log_prob(dict_swap[x]))
 
     # Accept or reject sample.
-    u = Uniform().sample()
+    u = tf.random_uniform([], dtype=ratio.dtype)
     accept = tf.log(u) < ratio
     sample_values = tf.cond(accept, lambda: list(six.itervalues(new_sample)),
                             lambda: list(six.itervalues(old_sample)))

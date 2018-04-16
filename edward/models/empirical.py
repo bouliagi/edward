@@ -24,7 +24,7 @@ class distributions_Empirical(Distribution):
   assert x.shape == ()
 
   # 5 samples of a 2 x 3 matrix
-  dp = Empirical(params=tf.zeros([5, 2, 3]))
+  x = Empirical(params=tf.zeros([5, 2, 3]))
   assert x.shape == (2, 3)
   ```
   """
@@ -120,5 +120,6 @@ _candidate = distributions_Empirical
 __init__.__doc__ = _candidate.__init__.__doc__
 _globals = globals()
 _params = {'__doc__': _candidate.__doc__,
-           '__init__': __init__}
+           '__init__': __init__,
+           'support': 'points'}
 _globals[_name] = type(_name, (RandomVariable, _candidate), _params)

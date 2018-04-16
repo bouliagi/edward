@@ -27,7 +27,7 @@ class distributions_PointMass(Distribution):
   assert x.shape == ()
 
   # 5 x 2 x 3 tensor
-  dp = PointMass(params=tf.zeros([5, 2, 3]))
+  x = PointMass(params=tf.zeros([5, 2, 3]))
   assert x.shape == (5, 2, 3)
   ```
   """
@@ -105,5 +105,6 @@ _candidate = distributions_PointMass
 __init__.__doc__ = _candidate.__init__.__doc__
 _globals = globals()
 _params = {'__doc__': _candidate.__doc__,
-           '__init__': __init__}
+           '__init__': __init__,
+           'support': 'point'}
 _globals[_name] = type(_name, (RandomVariable, _candidate), _params)
